@@ -337,9 +337,9 @@ objects:
         mkdir -p /tmp/output
         cd /tmp/output
 
-        function setup_ssh_bastion() {
+        function setup_selfhosted_ssh_bastion() {
           SSH_BASTION_NAMESPACE=openshift-ssh-bastion
-          echo "Setting up ssh bastion"
+          echo "Setting up selfhosted ssh bastion"
           mkdir -p ~/.ssh
           cp "${KUBE_SSH_KEY_PATH}" ~/.ssh/id_rsa
           chmod 0600 ~/.ssh/id_rsa
