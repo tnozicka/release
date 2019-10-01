@@ -264,7 +264,7 @@ presubmits:
         - name: JOB_NAME_SAFE
           value: e2e-aws-disruptive
         - name: TEST_COMMAND
-          value: setup_ssh_bastion; TEST_SUITE=openshift/disruptive run-tests
+          value: setup_selfhosted_ssh_bastion; TEST_SUITE=openshift/disruptive run-tests
         image: ci-operator:latest
         imagePullPolicy: Always
         name: ""
