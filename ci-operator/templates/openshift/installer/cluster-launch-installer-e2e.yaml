@@ -204,7 +204,11 @@ objects:
         value: ${IMAGE_FORMAT}
       - name: KUBECONFIG
         value: /tmp/artifacts/installer/auth/kubeconfig
+      - name: METADATA_FILE
+        value: /tmp/artifacts/installer/metadata.json
       - name: MIRROR_BASE
+        value: registry.svc.ci.openshift.org/${NAMESPACE}/release
+      - name: SSH_PRIVATE_KEY
         value: registry.svc.ci.openshift.org/${NAMESPACE}/release
       command:
       - /bin/bash
@@ -289,6 +293,7 @@ objects:
         fi
 
         # set up cloud-provider-specific env vars
+        export KUBE_SSH_BASTION="$( oc --insecure-skip-tls-verify get node -l node-role.kubernetes.io/master -o 'jsonpath={.items[0].status.addresses[?(@.type=="ExternalIP")].address}' ):22"
         export KUBE_SSH_KEY_PATH=/tmp/cluster/ssh-privatekey
         if [[ "${CLUSTER_TYPE}" == "gcp" ]]; then
           export GOOGLE_APPLICATION_CREDENTIALS="${GCP_SHARED_CREDENTIALS_FILE}"
@@ -365,6 +370,74 @@ objects:
           export KUBE_SSH_BASTION="${BASTION_HOST}:22"
         }
 
+
+        function setup_ssh_bastion_aws() {
+          echo "Setting up AWS ssh bastion"
+
+          # TODO: make sure we tag all the resources correctly and can destroy them later
+
+          [[ -f ${AWS_SHARED_CREDENTIALS_FILE} ]]
+
+          local region=$( jq -r '.aws.region' "${METADATA_FILE}" )
+          echo "Using region ${region}"
+
+          local infra_id=$( jq -r '.infraID' "${METADATA_FILE}" )
+          echo "infra_id is ${infra_id}"
+
+          local infra_tag=$( jq -r '.aws.identifier | map( keys[] | select(contains("'${infra_id}'")) )[0]' "${METADATA_FILE}" )
+          echo "infra_tag is ${infra_tag}"
+
+          local subnet_json=$( aws --region="${region}" ec2 describe-subnets --filters "Name=tag-key,Values=${infra_tag}" --output=json | jq -r '.Subnets | map( select( any(.Tags[]; .Key=="Name" and ( .Value | contains("public") ) ) ) )[0]' )
+
+          local vpc_id="$( echo "${subnet_json}" | jq -r '.VpcId' )"
+          echo "vpc_id is '${vpc_id}'"
+
+          local subnet_id=$( echo ${subnet_json} | jq -r '.SubnetId' )
+          echo "subnet_id is ${subnet_id}"
+
+          local sg_name="${infra_id}"-ssh
+          local sg_id=$( aws --region="${region}" ec2 describe-security-groups --filter="Name=vpc-id,Values=${vpc_id}" --filter="Name=group-name,Values=${sg_name}" --query="SecurityGroups[].GroupId" --output=text )
+          if [[ -z "${sg_id}" ]]; then
+          	local sg_id=$( aws --region="${region}" ec2 create-security-group --description=ssh --group-name="${sg_name}" --vpc-id="${vpc_id}" )
+          	aws --region="${region}" ec2 authorize-security-group-ingress --group-id="${sg_id}" --protocol=tcp --port 22 --cidr 0.0.0.0/0
+          fi;
+          echo "sg_id is ${sg_id}"
+
+          # This list the newest Centos image in AWS marketpace
+          # e.g. CENTOS_IMAGE_ID is ami-0f2b4fc905b0bd1f1
+          local image_id="${IMAGE_ID:-$( aws --region="${region}" ec2 describe-images --owners aws-marketplace --filters Name=product-code,Values=aw0evgkw8e5c1q413zgy5pjce --output=json | jq -r '.Images | sort_by(.CreationDate) | reverse | first | .ImageId' )}"
+          echo "Using image ${image_id}"
+
+          # FIXME: accept any key and create a machine with it
+          local instance_id="$( aws --region="${region}" ec2 run-instances --image-id="${image_id}" --count=1 --instance-type=t2.micro --key-name=libra --security-group-ids="${sg_id}" --subnet-id="${subnet_id}" --associate-public-ip-address --tag-specifications="ResourceType=instance,Tags=[{Key=Name,Value=${infra_id}-bastion},{Key=${infra_tag},Value=owned}]" --query='Instances[0].InstanceId' --output text)"
+          echo "instance_id is '${instance_id}'"
+
+          local bastion_ip=None
+          while [ "${bastion_ip}" == "None" ]; do
+          	bastion_ip="$( aws --region="${region}" ec2 describe-instances --instance-ids="${instance_id}" --query='Reservations[0].Instances[0].PublicIpAddress' --output=text)"
+          done
+
+          echo "Bastion is starting..."
+          echo "  bastion_ip=${bastion_ip}"
+
+          local bastion_user=${BASTION_USER:-centos}
+
+          bastion_user=${bastion_user} bastion_ip=${bastion_ip} timeout --foreground 5m bash -exuo pipefail -c 'until ssh -T -oStrictHostKeyChecking=no "${bastion_user}@${bastion_ip}" exit; do sleep 5; done'
+        }
+
+        function setup_ssh_bastion() {
+          case "${CLUSTER_TYPE}" in
+          "aws")
+            setup_ssh_bastion_aws
+            ;;
+          *)
+            echo "SSH bastion is not yet supported for CLUSTER_TYPE '${CLUSTER_TYPE}'" >&2
+            exit 1
+            ;;
+          esac
+        }
+
+
         function setup-google-cloud-sdk() {
           pushd /tmp
           curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-256.0.0-linux-x86_64.tar.gz
@@ -391,7 +464,7 @@ objects:
           setup-google-cloud-sdk
         fi
 
-        ${TEST_COMMAND}
+        eval ${TEST_COMMAND}
 
     # Runs an install
     - name: setup
